@@ -1,0 +1,7 @@
+# Router-specific configuration and runtime data
+/etc/config/gwifi
+*.log
+*.bak
+*.tar.gz
+*.ipk
+*.apk

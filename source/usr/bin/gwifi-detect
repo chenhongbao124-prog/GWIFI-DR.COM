@@ -1,0 +1,77 @@
+#!/bin/sh
+. /usr/lib/gwifi/common.sh
+. /lib/functions.sh
+. /lib/functions/network.sh
+
+IFACE="${1:-wan}"
+SECTION="$2"
+case "$SECTION" in *[!a-zA-Z0-9_]*) exit 1;; esac
+[ -z "$SECTION" ] || [ "$(uci -q get gwifi.$SECTION)" = line ] || exit 1
+TARGET="${SECTION:-config}"
+gwifi_operation_lock || exit 75
+DEVICE=$(gwifi_device "$IFACE") || DEVICE="$IFACE"
+UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+logger -t gwifi-detect "Start probing parameters on $DEVICE"
+echo "======================================"
+echo "🔍 开始探测校园网参数..."
+
+HEADERS=$(curl -4 -s -D - -o /dev/null -m 5 --interface "$DEVICE" -A "$UA" http://connect.rom.miui.com/generate_204)
+LOCATION=$(echo "$HEADERS" | grep -i '^Location:' | tr -d '\r')
+
+if [ -z "$LOCATION" ]; then
+    HEADERS=$(curl -4 -s -D - -o /dev/null -m 5 --interface "$DEVICE" -A "$UA" http://1.1.1.1)
+    LOCATION=$(echo "$HEADERS" | grep -i '^Location:' | tr -d '\r')
+fi
+
+if [ -z "$LOCATION" ]; then
+    logger -t gwifi-detect "Probe failed: no Location header found"
+    echo "❌ 探测失败：网关没有返回重定向，请确认当前是未认证状态。"
+    exit 1
+fi
+
+NAS_NAME=$(echo "$LOCATION" | sed -n 's/.*wlanacname=\([^&]*\).*/\1/p')
+SRV_IP=$(echo "$LOCATION" | sed -n 's|.*http://\([^/]*\)/.*|\1|p')
+
+logger -t gwifi-detect "Found NAS=$NAS_NAME, SRV_IP=$SRV_IP"
+echo "✅ 发现 NAS 名称: $NAS_NAME"
+echo "✅ 发现认证服务器 IP: $SRV_IP"
+
+[ -n "$NAS_NAME" ] && gwifi_ipv4 "$SRV_IP" || exit 1
+
+# 获取 AES 密钥
+USER_IP=$(gwifi_ipaddr "$IFACE" "$DEVICE")
+LOGIN_URL="http://$SRV_IP/gportal/web/login?wlanacname=$NAS_NAME&wlanuserip=$USER_IP"
+PAGE=$(curl -4 -s -m 10 --interface "$DEVICE" -A "$UA" "$LOGIN_URL")
+JS_URL=$(echo "$PAGE" | grep -oE 'src="[^"]*aes\.js[^"]*"' | cut -d'"' -f2 | head -1)
+
+AES_KEY=""
+if [ -n "$JS_URL" ]; then
+    case "$JS_URL" in
+        http*) ;;
+        /*) JS_URL="http://$SRV_IP$JS_URL" ;;
+        *) JS_URL="http://$SRV_IP/gportal/Static/template/public/js/$JS_URL" ;;
+    esac
+    JS_CONTENT=$(curl -4 -s -m 5 --interface "$DEVICE" -A "$UA" "$JS_URL")
+    AES_KEY=$(echo "$JS_CONTENT" | grep -oE "parse\(['\"][a-zA-Z0-9]{16}['\"]\)" | grep -oE "[a-zA-Z0-9]{16}" | head -1)
+    if [ -z "$AES_KEY" ]; then
+        AES_KEY=$(echo "$JS_CONTENT" | grep -oE "(key|Key)\s*=\s*['\"][a-zA-Z0-9]{16}['\"]" | grep -oE "[a-zA-Z0-9]{16}" | head -1)
+    fi
+fi
+
+if [ -n "$AES_KEY" ]; then
+    logger -t gwifi-detect "AES key found (value omitted)"
+    echo "✅ 已发现 AES 密钥并保存（不显示内容）"
+    uci set gwifi.$TARGET.aes_key="$AES_KEY"
+else
+    logger -t gwifi-detect "AES Key not found in js, keeping original"
+    echo "⚠️ 未能提取到 AES 密钥（保留原有配置）。"
+fi
+
+uci set gwifi.$TARGET.srv_ip="$SRV_IP"
+uci set gwifi.$TARGET.nas_name="$NAS_NAME"
+uci commit gwifi
+logger -t gwifi-detect "Parameters committed to UCI"
+
+echo "======================================"
+echo "🎉 参数已自动更新并保存到配置！"

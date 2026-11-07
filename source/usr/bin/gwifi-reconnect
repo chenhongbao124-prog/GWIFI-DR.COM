@@ -1,0 +1,29 @@
+#!/bin/sh
+. /lib/functions.sh
+. /lib/functions/network.sh
+. /usr/lib/gwifi/common.sh
+config_load gwifi
+
+SECTION="$1"
+case "$SECTION" in ''|*[!a-zA-Z0-9_]*) exit 1;; esac
+gwifi_operation_lock || exit 75
+config_load gwifi
+config_get TYPE "$SECTION" TYPE
+[ "$TYPE" = line ] || exit 1
+
+uci set "gwifi.$SECTION.enabled=1"
+uci -q delete "gwifi.$SECTION.manual_hold"
+uci set "gwifi.$SECTION.last_status=reconnecting"
+uci commit gwifi
+
+if /bin/sh /usr/bin/gwifi-login "$SECTION" manual; then
+    uci set "gwifi.$SECTION.last_status=online"
+    uci commit gwifi
+    logger -t gwifi "[$SECTION] reconnect OK"
+    exit 0
+fi
+
+uci set "gwifi.$SECTION.last_status=offline"
+uci commit gwifi
+logger -t gwifi "[$SECTION] reconnect failed"
+exit 1

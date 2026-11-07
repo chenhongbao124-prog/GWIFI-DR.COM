@@ -1,0 +1,8 @@
+#!/bin/sh
+case "$1" in route) CMD=/usr/bin/gwifi-handover; KEY=handover_interval;; ttl) CMD=/usr/bin/gwifi-ttl-guard; KEY=ttl_interval;; nas) CMD=/usr/bin/gwifi-nas-watch; KEY=nas_check_interval;; login) CMD=/usr/bin/gwifi-cron.sh; KEY=interval;; *) exit 2;; esac
+while :; do
+ if [ "$1" = route ]; then "$CMD" check; else "$CMD"; fi
+ MIN=$(uci -q get gwifi.config.$KEY)
+ case "$MIN" in 1|3|5|10|15|30|60) ;; *) MIN=3;; esac
+ sleep $((MIN * 60))
+done

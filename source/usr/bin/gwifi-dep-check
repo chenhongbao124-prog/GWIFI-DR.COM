@@ -1,0 +1,26 @@
+#!/bin/sh
+. /usr/share/libubox/jshn.sh
+json_init; json_add_array deps
+item() {
+ json_add_object ""; json_add_string name "$1"; json_add_int ok "$2"; json_add_string desc "$3"
+ [ -z "$4" ] || json_add_string package "$4"
+ [ -z "$5" ] || json_add_string manager "$5"
+ json_close_object
+}
+if command -v apk >/dev/null 2>&1; then item "包管理器 (apk)" 1 "本机使用 apk add" "" apk;
+elif command -v opkg >/dev/null 2>&1; then item "包管理器 (opkg / ipk)" 1 "本机使用 opkg install" "" opkg;
+else item 包管理器 0 "未找到 apk 或 opkg"; fi
+for pair in curl:curl openssl:openssl-util flock:flock; do
+ cmd=$(echo "$pair" | cut -d: -f1); pkg=$(echo "$pair" | cut -d: -f2)
+ if command -v "$cmd" >/dev/null 2>&1; then item "$cmd" 1 "认证所需命令可用";
+ else item "$cmd" 0 "缺少认证所需命令" "$pkg"; fi
+done
+if ip rule show >/dev/null 2>&1 && ip netns list >/dev/null 2>&1; then item ip-full 1 "策略路由和隔离网卡命令可用";
+else item ip-full 0 "多线路路由或隔离网卡命令不完整" ip-full; fi
+if command -v iptables >/dev/null 2>&1 && command -v iptables-restore >/dev/null 2>&1 && iptables -t mangle -S >/dev/null 2>&1; then
+ item "IPv4 TTL 规则工具" 1 "工具可用；规则是否正确、是否命中请查看 TTL 页面。未抓包验证。";
+else item "IPv4 TTL 规则工具" 0 "需要 iptables、iptables-restore 及相匹配的 mangle/TTL 模块；仅有 nft 不足以运行当前 TTL 检查"; fi
+if command -v nft >/dev/null 2>&1; then item "NAS 出口接替工具" 1 "nft 可用；不代表已完成迁移或与 Clash 验证兼容";
+else item "NAS 出口接替工具" 0 "缺少 nft，自动出口接替不可用" nftables; fi
+json_close_array
+json_dump | jsonfilter -e "@.deps"

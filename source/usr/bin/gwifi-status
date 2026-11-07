@@ -1,0 +1,126 @@
+#!/bin/sh
+. /usr/lib/gwifi/common.sh
+. /usr/share/libubox/jshn.sh
+. /lib/functions.sh
+. /lib/functions/network.sh
+config_load gwifi
+
+json_line() {
+    local s="$1" e st i d ip nas err mac type code auth_reason auth_time auth_message
+    config_get_bool e "$s" enabled 0
+    config_get st "$s" last_status "unknown"
+    config_get i "$s" iface
+    config_get nas "$s" auth_nas
+    [ -n "$nas" ] || config_get nas "$s" nas_name
+    [ -n "$nas" ] || config_get nas config nas_name ""
+    config_get err "$s" last_error ""
+    config_get auth_reason "$s" last_auth_reason "$err"
+    config_get auth_message "$s" last_auth_message
+    config_get auth_time "$s" last_auth_failure_time
+    [ -n "$auth_time" ] || config_get auth_time "$s" auth_time
+    code=
+    type=$(uci -q get gwifi.$s.TYPE)
+
+    ip=""
+    mac=""
+
+    GWIFI_NET_REASON=not_checked; GWIFI_HTTP_CODE=
+    if [ "$type" = namespace ]; then
+        d="$i"
+        if ip netns list 2>/dev/null | grep -q "^$s "; then
+            ip=$(ip netns exec "$s" ip -4 addr show "$i" 2>/dev/null | awk '/inet / {split($2,a,"/");print a[1];exit}')
+            mac=$(ip netns exec "$s" cat /sys/class/net/"$i"/address 2>/dev/null)
+            if [ "$e" = 1 ] && [ -n "$ip" ]; then
+                if gwifi_check_connectivity "$i" "" "" "$s"; then st=online; err=; else st=offline; err="$GWIFI_HTTP_CODE"; fi
+            else st=offline; GWIFI_NET_REASON=no_ip; fi
+        else st=offline; GWIFI_NET_REASON=namespace_missing; fi
+    else
+        d=$(gwifi_device "$i" 2>/dev/null)
+        if [ -n "$d" ]; then
+            ip=$(gwifi_ipaddr "$i" "$d" 2>/dev/null)
+            mac=$(cat /sys/class/net/"$d"/address 2>/dev/null)
+            if [ "$e" = 1 ] && [ -n "$ip" ]; then
+                if gwifi_check_connectivity "$d"; then st=online; err=; else st=offline; err="$GWIFI_HTTP_CODE"; fi
+            else st=offline; GWIFI_NET_REASON=no_ip; fi
+        else st=offline; GWIFI_NET_REASON=no_device; fi
+    fi
+    [ "$e" = 1 ] || { st=disabled; GWIFI_NET_REASON=disabled; }
+    code="$GWIFI_HTTP_CODE"
+    local phase until now remain blocked configured parent role main migrating phase_at
+    phase=$(cat /var/run/gwifi-state/$s.phase 2>/dev/null)
+    until=$(cat /var/run/gwifi-state/$s.retry 2>/dev/null)
+    case "$until" in ''|*[!0-9]*) until=0;; esac
+    now=$(gwifi_uptime); remain=$((until-now)); [ "$remain" -gt 0 ] || remain=0
+    phase_at=$(cat /var/run/gwifi-state/$s.phase_at 2>/dev/null)
+    case "$phase_at" in ''|*[!0-9]*) phase_at=0;; esac
+    [ "$((now-phase_at))" -le 120 ] || phase=waiting
+    config_get blocked "$s" auth_blocked_reason
+    if [ -n "$blocked" ] && [ "$(uci -q get gwifi.$s.auth_blocked_fingerprint)" != "$(gwifi_fingerprint "$s")" ]; then blocked=; fi
+    if [ "$st" = online ]; then phase=online; remain=0; blocked=;
+    elif [ "$st" = disabled ]; then phase=stopped;
+    elif [ -n "$blocked" ]; then phase=paused;
+    elif [ "$remain" -gt 0 ]; then phase=cooldown;
+    elif [ "$phase" != authenticating ]; then phase=waiting; fi
+    config_get configured "$s" nas_name
+    parent=$(gwifi_parent "$d" 2>/dev/null)
+    main=$(ip -4 route show default | head -1 | awk '{for(i=1;i<=NF;i++)if($i=="dev")print $(i+1)}')
+    role=secondary; [ "$d" != "$main" ] || role=primary
+    migrating=$(cat /var/run/gwifi-handover/current 2>/dev/null)
+    if [ -n "$migrating" ]; then
+        pair=$(cat /var/run/gwifi-handover/slot-$migrating 2>/dev/null)
+        src=$(echo "$pair" | cut -d" " -f1); dst=$(echo "$pair" | cut -d" " -f2)
+        [ "$dst" != "$s" ] || { [ "$(uci -q get gwifi.$src.migration_state)" != active ] || role=handover; }
+    fi
+    json_init
+    json_add_int enabled "$e"
+    json_add_string section "$s"
+    json_add_string status "$st"
+    json_add_string iface "$i"
+    json_add_string device "$d"
+    json_add_string ip "$ip"
+    json_add_string nas "$nas"
+    json_add_string error "$err"
+    json_add_string mac "$mac"
+    json_add_string auth_reason "$auth_reason"
+    json_add_string auth_message "$auth_message"
+    json_add_string probe_code "$code"
+    json_add_string auth_time "$auth_time"
+    json_add_string net_reason "$GWIFI_NET_REASON"
+    json_add_string phase "$phase"
+    json_add_int retry_seconds "$remain"
+    json_add_string blocked_reason "$blocked"
+    json_add_string configured_nas "$configured"
+    json_add_string parent "$parent"
+    json_add_string role "$role"
+    json_add_string detected_nas "$(cat /var/run/gwifi-nas-found-$s 2>/dev/null)"
+    json_add_string migration "$(uci -q get gwifi.$s.migration_state)"
+    json_dump
+}
+
+SECTION="$1"
+if [ -z "$SECTION" ]; then
+    umask 077
+    TMP=$(mktemp -d /var/run/gwifi-status.XXXXXX) || exit 1
+    trap 'rm -rf "$TMP"' EXIT
+    SECTIONS=$(uci show gwifi | grep -E "=line$|=namespace$" | cut -d. -f2 | cut -d= -f1)
+    batch=0
+    for s in $SECTIONS; do
+        (json_line "$s" > "$TMP/$s") &
+        batch=$((batch+1))
+        if [ "$batch" -ge 8 ]; then wait; batch=0; fi
+    done
+    wait
+    echo -n '['
+    FIRST=1
+    for s in $SECTIONS; do
+        [ -s "$TMP/$s" ] || continue
+        [ "$FIRST" = 1 ] || echo -n ,
+        FIRST=0
+        cat "$TMP/$s"
+    done
+    echo ']'
+else
+    case "$SECTION" in *[!a-zA-Z0-9_]*) exit 2;; esac
+    json_line "$SECTION"
+    echo
+fi

@@ -1,0 +1,59 @@
+#!/bin/sh
+. /usr/lib/gwifi/common.sh
+. /lib/functions.sh
+. /lib/functions/network.sh
+config_load gwifi
+
+SECTION="$1"
+case "$SECTION" in ''|*[!a-zA-Z0-9_]*) exit 1;; esac
+gwifi_operation_lock || exit 75
+config_load gwifi
+config_get TYPE "$SECTION" TYPE
+[ "$TYPE" = line ] || exit 1
+
+config_get SRV_IP   config srv_ip
+config_get NAS_NAME config nas_name
+gwifi_line_settings "$SECTION"
+config_get IFACE    "$SECTION" iface
+DEVICE=$(gwifi_device "$IFACE") || { echo "找不到网卡 $IFACE"; exit 1; }
+USER_IP=$(gwifi_ipaddr "$IFACE" "$DEVICE")
+gwifi_ipv4 "$USER_IP" || { logger -t gwifi "[$SECTION] no IPv4"; echo "网卡 $IFACE 没有有效 IP，可能已断网"; exit 1; }
+
+/usr/bin/gwifi-auth-route "$IFACE" || exit 1
+
+UA='Mozilla/5.0 (iPad; CPU OS 15_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.0 Mobile/15E148 Safari/604.1'
+TEMP=$(mktemp -d /var/run/gwifi-logout.XXXXXX) || exit 1
+trap 'rm -rf "$TEMP"' EXIT
+
+curl -4 --noproxy '*' -fsS --connect-timeout 5 --max-time 15 \
+  --proto '=http' --interface "$DEVICE" -A "$UA" \
+  --cookie "$TEMP/c" --cookie-jar "$TEMP/c" \
+  "http://$SRV_IP/gportal/web/login?wlanacname=$NAS_NAME&wlanuserip=$USER_IP" \
+  -o "$TEMP/page.html" || { echo "无法获取认证页面"; exit 1; }
+
+SIGN=$(awk '/<form id="frmLogout"/,/<\/form>/' "$TEMP/page.html" \
+  | grep -o 'name="sign" value="[^"]*"' | head -1 | sed 's/.*value="//;s/"$//')
+[ -z "$SIGN" ] && { logger -t gwifi "[$SECTION] no logout sign"; echo "获取注销凭据失败，可能已掉线"; exit 1; }
+
+RESP=$(curl -4 --noproxy '*' -sS --connect-timeout 5 --max-time 15 \
+  --proto '=http' --interface "$DEVICE" -A "$UA" \
+  --data-urlencode "nasName=$NAS_NAME" --data-urlencode "nasIp=" \
+  --data-urlencode "userIp=$USER_IP" --data-urlencode "userMac=" \
+  --data-urlencode "ssid=" --data-urlencode "apMac=" \
+  --data-urlencode "pid=23" --data-urlencode "vlan=1" \
+  --data-urlencode "sign=$SIGN" --data-urlencode "redirectUrl=http://1.2.3.4" \
+  --data-urlencode "portalTemplateId=23" --data-urlencode "is_mobile=0" \
+  "http://$SRV_IP/gportal/web/authLogout")
+
+if echo "$RESP" | grep -q '"status":1'; then
+    uci set "gwifi.$SECTION.enabled=0"
+    uci set "gwifi.$SECTION.manual_hold=1"
+    gwifi_phase "$SECTION" stopped
+    uci set "gwifi.$SECTION.last_status=logged_out"
+    uci commit gwifi
+    logger -t gwifi "[$SECTION] soft logout OK, IP retained"
+    exit 0
+fi
+logger -t gwifi "[$SECTION] soft logout rejected; response body omitted"
+echo "服务器拒绝注销"
+exit 1

@@ -1,0 +1,273 @@
+#!/bin/sh
+umask 077
+. /lib/functions.sh
+. /lib/functions/network.sh
+. /usr/share/libubox/jshn.sh
+. /usr/lib/gwifi/common.sh
+
+config_load gwifi
+
+SECTION="$1"
+case "$SECTION" in
+    ''|*[!a-zA-Z0-9_]*) exit 1 ;;
+esac
+
+exec 6>"/var/run/gwifi-auth-$SECTION.lock"
+gwifi_operation_lock || exit 75
+flock -n 6 || { echo '本线路正在认证，请稍后重试。'; exit 75; }
+config_load gwifi
+
+config_get TYPE "$SECTION" TYPE
+[ "$TYPE" = line ] || exit 1
+
+config_get_bool ENABLED "$SECTION" enabled 1
+[ "$ENABLED" = 1 ] || { logger -t gwifi "[$SECTION] disabled, skip login"; exit 0; }
+
+config_get ACCOUNT "$SECTION" account
+config_get PASSWORD "$SECTION" password
+config_get IFACE "$SECTION" iface
+gwifi_retry_allowed "$SECTION" "$2" || exit 76
+gwifi_phase "$SECTION" authenticating
+REASON=unknown; AUTH_MESSAGE=认证尚未完成
+FINAL_RECORDED=0
+finish_login() {
+    local result="$?"
+    if [ "$result" != 0 ] && [ "$FINAL_RECORDED" != 1 ]; then
+        record_issue
+        gwifi_retry_failure "$SECTION" "$REASON"
+        uci set "gwifi.$SECTION.last_status=offline"
+        uci set "gwifi.$SECTION.last_error=$REASON"
+        uci commit gwifi
+    elif [ "$result" = 0 ]; then
+        gwifi_retry_success "$SECTION"
+        uci commit gwifi
+    fi
+    [ -z "$TEMP" ] || { rm -f "$TEMP/cookies"; rmdir "$TEMP" 2>/dev/null; }
+}
+trap finish_login EXIT
+
+record_issue() {
+    uci set "gwifi.$SECTION.last_auth_reason=$REASON"
+    uci set "gwifi.$SECTION.last_auth_message=$AUTH_MESSAGE"
+    uci set "gwifi.$SECTION.last_auth_failure_time=$(date +%Y-%m-%d_%H:%M:%S)"
+    uci commit gwifi
+}
+do_auth() {
+    /usr/bin/gwifi-auth-route "$IFACE" || { REASON=route_unavailable; AUTH_MESSAGE=该网卡缺少可用出口，请检查网关配置; record_issue; return 1; }
+    if ! /usr/bin/gwifi-env-check "$SECTION" >/dev/null 2>&1; then
+        REASON=environment; AUTH_MESSAGE=缺少认证所需组件，请查看环境依赖检测
+        logger -t gwifi "环境检查失败，拒绝发起认证。";
+        exit 1;
+    fi
+
+    config_load gwifi
+    config_get SRV_IP config srv_ip
+    config_get NAS_NAME config nas_name
+    config_get AES_KEY config aes_key
+    gwifi_line_settings "$SECTION"
+    config_get_bool REBIND config rebind 1
+    [ "$GWIFI_TRIAL" != 1 ] || REBIND=0
+    config_get ENCODING config payload_encoding form
+    REASON=unknown
+    AUTH_MESSAGE=
+    config_get SPOOF_DEV "$SECTION" spoof_device "pc"
+    config_get CUSTOM_UA "$SECTION" custom_ua ""
+
+    if [ -n "$CUSTOM_UA" ]; then
+        UA="$CUSTOM_UA"
+    elif [ "$SPOOF_DEV" = "tablet" ]; then
+        UA="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Safari/605.1.15"
+    elif [ "$SPOOF_DEV" = "phone" ]; then
+        UA="Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1"
+    elif [ "$SPOOF_DEV" = "ipad" ]; then
+        UA="Mozilla/5.0 (iPad; CPU OS 15_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.0 Mobile/15E148 Safari/604.1"
+    elif [ "$SPOOF_DEV" = "iphone" ]; then
+        UA="Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1"
+    elif [ "$SPOOF_DEV" = "android" ]; then
+        UA="Mozilla/5.0 (Linux; Android 13; SM-G998B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
+    else
+        UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    fi
+
+    if [ "$SPOOF_DEV" = "tablet" ] || [ "$SPOOF_DEV" = "phone" ] || [ "$SPOOF_DEV" = "android" ] || [ "$SPOOF_DEV" = "iphone" ] || [ "$SPOOF_DEV" = "ipad" ]; then
+        IS_MOBILE_VAL=1
+    else
+        IS_MOBILE_VAL=0
+    fi
+
+    [ -n "$ACCOUNT" ] && [ -n "$PASSWORD" ] && [ -n "$NAS_NAME" ] || { logger -t gwifi "[$SECTION] missing account/password/nas"; exit 1; }
+    gwifi_ipv4 "$SRV_IP" || { logger -t gwifi "[$SECTION] Invalid server IPv4 address"; exit 1; }
+    KEY_HEX=$(gwifi_hex "$AES_KEY")
+    [ "${#KEY_HEX}" = 32 ] || { logger -t gwifi "[$SECTION] AES key must be exactly 16 bytes"; exit 1; }
+
+    DEVICE=$(gwifi_device "$IFACE") || { logger -t gwifi "[$SECTION] Interface $IFACE not found"; exit 1; }
+    USER_IP=$(gwifi_ipaddr "$IFACE" "$DEVICE")
+    gwifi_ipv4 "$USER_IP" || { logger -t gwifi "[$SECTION] no usable IPv4 address on $DEVICE"; exit 1; }
+
+
+    URL_NAS="$NAS_NAME"
+    [ "$ENCODING" != form ] || URL_NAS=$(gwifi_urlencode "$NAS_NAME")
+    LOGIN_URL="http://$SRV_IP/gportal/web/login?wlanacname=$URL_NAS&wlanuserip=$USER_IP"
+    if [ "$SPOOF_DEV" = "tablet" ] || [ "$SPOOF_DEV" = "phone" ] || [ "$SPOOF_DEV" = "android" ] || [ "$SPOOF_DEV" = "iphone" ] || [ "$SPOOF_DEV" = "ipad" ]; then
+        LOGIN_URL="${LOGIN_URL}&is_mobile=1"
+    fi
+    TEMP=$(mktemp -d /var/run/gwifi-login.XXXXXX) || exit 1
+
+    LOGIN_PAGE=$(curl -4 --noproxy '*' -fsS --connect-timeout 5 --max-time 15 --proto '=http' --interface "$DEVICE" -A "$UA" --cookie "$TEMP/cookies" --cookie-jar "$TEMP/cookies" "$LOGIN_URL") || { REASON=login_page; AUTH_MESSAGE=无法取得认证页面，未收到服务器原因码; logger -t gwifi "[$SECTION] curl get LOGIN_PAGE failed"; return 2; }
+    SIGN=$(printf '%s' "$LOGIN_PAGE" | gwifi_html_value sign)
+    IV=$(printf '%s' "$LOGIN_PAGE" | gwifi_html_value iv)
+
+    [ -n "$SIGN" ] && [ -n "$IV" ] || { REASON=login_fields; AUTH_MESSAGE=认证页面缺少必要参数; logger -t gwifi "[$SECTION] Failed to get SIGN/IV"; return 2; }
+
+    IV_HEX=$(gwifi_hex "$IV")
+    [ "${#IV_HEX}" = 32 ] || { logger -t gwifi "[$SECTION] IV is not 16 bytes"; return 1; }
+
+    field() {
+        if [ "$ENCODING" = "form" ]; then gwifi_urlencode "$1"; else printf '%s' "$1"; fi
+    }
+
+    # 如果没有传入 MAC，则自动获取当前物理网卡的真实 MAC
+    MAC="$1"
+    if [ -z "$MAC" ]; then
+        MAC=$(cat /sys/class/net/"$DEVICE"/address 2>/dev/null)
+    fi
+
+    DATA="nasName=$(field "$NAS_NAME")&nasIp=&userIp=$USER_IP&userMac=$(field "$MAC")&ssid=&apMac=&pid=23&vlan=1&sign=$(field "$SIGN")&iv=$(field "$IV")&redirectUrl=http://1.2.3.4&portalTemplateId=23&is_mobile=${IS_MOBILE_VAL}&account_type=&name=$(field "$ACCOUNT")&password=$(field "$PASSWORD")"
+
+    len=$(LC_ALL=C printf '%s' "$DATA" | wc -c)
+    pad=$((16 - len % 16))
+    ENC=$( (printf '%s' "$DATA"; dd if=/dev/zero bs=1 count="$pad" 2>/dev/null) | openssl enc -aes-128-cbc -K "$KEY_HEX" -iv "$IV_HEX" -nopad -a -A )
+
+    RESP=$(curl -4 --noproxy '*' -fsS --connect-timeout 5 --max-time 15 --proto '=http' --interface "$DEVICE" -A "$UA" -H "Referer: $LOGIN_URL" -H 'X-Requested-With: XMLHttpRequest' --data-urlencode "data=$ENC" --data-urlencode "iv=$IV" "http://$SRV_IP/gportal/web/authLogin?round=$(date +%s)") || { REASON=request_failed; AUTH_MESSAGE=认证请求失败或超时; logger -t gwifi "[$SECTION] curl authLogin failed"; return 1; }
+
+    if echo "$RESP" | grep -q "操作过于频繁"; then
+        REASON=rate_limit; AUTH_MESSAGE=操作过于频繁，等待一分钟再试
+        logger -t gwifi "[$SECTION] Rate limit detected; retry delayed"
+        return 1
+    fi
+
+    json_load "$RESP" >/dev/null 2>&1 || { logger -t gwifi "[$SECTION] invalid JSON response"; return 1; }
+    json_get_var STATUS status
+    if [ "$STATUS" = "1" ]; then
+        uci set "gwifi.$SECTION.auth_time=$(date +%Y-%m-%d_%H:%M:%S)"
+        uci set "gwifi.$SECTION.last_status=online"
+        uci set "gwifi.$SECTION.auth_nas=$NAS_NAME"
+        uci -q delete "gwifi.$SECTION.last_error"
+        uci commit gwifi
+        REDIRECT=$(echo "$RESP" | sed -n 's/.*"redirectUrl":"\([^"]*\)".*/\1/p' | sed 's|\\/|/|g; s|^/gportal/web/||')
+        if [ -n "$REDIRECT" ]; then
+            uci set "gwifi.$SECTION.logout_url=$REDIRECT"
+            uci set "gwifi.$SECTION.last_status=online"
+            uci set "gwifi.$SECTION.auth_nas=$NAS_NAME"
+    uci delete "gwifi.$SECTION.last_error" 2>/dev/null
+            uci commit gwifi
+        fi
+        return 0
+    fi
+
+    # 【核心修复】强行从嵌套的 JSON 中提取 reasoncode
+    REASON=$(gwifi_auth_reason "$RESP")
+    AUTH_MESSAGE=$(gwifi_auth_message "$RESP")
+    case "$REASON" in
+        ''|*[!0-9]*) REASON=unknown ;;
+    esac
+    record_issue
+    logger -t gwifi "[$SECTION] authentication rejected (reason: $REASON)"
+
+    if [ "$REASON" = "43" ] && [ "$REBIND" = "1" ]; then
+        REBIND_LAST=$(cat /var/run/gwifi-state/$SECTION.rebind 2>/dev/null)
+        case "$REBIND_LAST" in ''|*[!0-9]*) REBIND_LAST=0;; esac
+        REBIND_NOW=$(gwifi_uptime)
+        if [ "$REBIND_LAST" -gt 0 ] && [ "$((REBIND_NOW-REBIND_LAST))" -lt 300 ]; then
+            AUTH_MESSAGE=设备互踢，五分钟内已尝试重新绑定，暂不重复操作
+            return 1
+        fi
+        echo "$REBIND_NOW" > /var/run/gwifi-state/$SECTION.rebind
+        # 【核心修复】强行提取 bindmac
+        BINDMAC=$(echo "$RESP" | sed -n 's/.*"bindmac":"\([^"]*\)".*/\1/p')
+        if [ -z "$BINDMAC" ]; then
+            logger -t gwifi "[$SECTION] bindmac is empty, skip rebind"
+            return 1
+        fi
+        
+        logger -t gwifi "[$SECTION] MAC mismatch, attempting to rebind to $BINDMAC"
+        
+        DATA2="nasName=$(field "$NAS_NAME")&nasIp=&userIp=$USER_IP&userMac=$(field "$BINDMAC")&ssid=&apMac=&pid=23&vlan=1&sign=$(field "$SIGN")&iv=$(field "$IV")&redirectUrl=http://1.2.3.4&portalTemplateId=23&is_mobile=${IS_MOBILE_VAL}&account_type=&name=$(field "$ACCOUNT")&password=$(field "$PASSWORD")"
+        len2=$(LC_ALL=C printf '%s' "$DATA2" | wc -c)
+        pad2=$((16 - len2 % 16))
+        ENC2=$( (printf '%s' "$DATA2"; dd if=/dev/zero bs=1 count="$pad2" 2>/dev/null) | openssl enc -aes-128-cbc -K "$KEY_HEX" -iv "$IV_HEX" -nopad -a -A )
+
+        RESP_REBIND=$(curl -4 --noproxy '*' -fsS --connect-timeout 5 --max-time 15 --proto '=http' --interface "$DEVICE" -A "$UA" -H "Referer: $LOGIN_URL" --data-urlencode "data=$ENC2" --data-urlencode "iv=$IV" "http://$SRV_IP/gportal/web/reBindMac?round=$(date +%s)") || RESP_REBIND=""
+        
+        REBIND_REASON=$(gwifi_auth_reason "$RESP_REBIND")
+        if [ -n "$REBIND_REASON" ] && [ "$REBIND_REASON" != 0 ]; then
+            REASON="$REBIND_REASON"; AUTH_MESSAGE=$(gwifi_auth_message "$RESP_REBIND"); record_issue
+            echo "REASON:$REASON"
+            return 1
+        fi
+        if echo "$RESP_REBIND" | grep -q '"status":1'; then
+            logger -t gwifi "[$SECTION] reBindMac accepted by server, retrying authLogin"
+        else
+            logger -t gwifi "[$SECTION] reBindMac not accepted; response body omitted"
+        fi
+        
+        logger -t gwifi "[$SECTION] waiting 6s to bypass rate limit..."
+        sleep 6
+        RESP2=$(curl -4 --noproxy '*' -fsS --connect-timeout 5 --max-time 15 --proto '=http' --interface "$DEVICE" -A "$UA" -H "Referer: $LOGIN_URL" -H 'X-Requested-With: XMLHttpRequest' --data-urlencode "data=$ENC2" --data-urlencode "iv=$IV" "http://$SRV_IP/gportal/web/authLogin?round=$(date +%s)") || return 1
+        
+        json_load "$RESP2" >/dev/null 2>&1 || return 1
+        json_get_var STATUS status
+        SECOND_REASON=$(gwifi_auth_reason "$RESP2")
+        [ -z "$SECOND_REASON" ] || REASON="$SECOND_REASON"
+        AUTH_MESSAGE=$(gwifi_auth_message "$RESP2")
+        if [ "$STATUS" = "1" ]; then
+            uci set "gwifi.$SECTION.auth_time=$(date +%Y-%m-%d_%H:%M:%S)"
+            uci set "gwifi.$SECTION.last_status=online"
+            uci set "gwifi.$SECTION.auth_nas=$NAS_NAME"
+            uci -q delete "gwifi.$SECTION.last_error"
+            uci commit gwifi
+            REDIRECT=$(echo "$RESP2" | sed -n 's/.*"redirectUrl":"\([^"]*\)".*/\1/p' | sed 's|\\/|/|g; s|^/gportal/web/||')
+            if [ -n "$REDIRECT" ]; then
+                uci set "gwifi.$SECTION.logout_url=$REDIRECT"
+                uci set "gwifi.$SECTION.last_status=online"
+            uci set "gwifi.$SECTION.auth_nas=$NAS_NAME"
+    uci delete "gwifi.$SECTION.last_error" 2>/dev/null
+                uci commit gwifi
+            fi
+            return 0
+        else
+            record_issue
+            logger -t gwifi "[$SECTION] authLogin after rebind failed (reason: $REASON)"
+        fi
+    fi
+    return 1
+}
+
+do_auth ""
+RET=$?
+
+if [ "$RET" = 0 ]; then
+    exit 0
+fi
+
+if [ "$RET" = 2 ] && [ "$GWIFI_TRIAL" != 1 ]; then
+    logger -t gwifi "[$SECTION] NAS or Server IP mismatch detected, auto-detecting..."
+    if /usr/bin/gwifi-detect "$IFACE" "$SECTION" >/dev/null 2>&1; then
+    logger -t gwifi "[$SECTION] auto-detect finished, retrying login..."
+    do_auth ""
+    RET=$?
+    fi
+fi
+
+if [ "$RET" != 0 ]; then
+    record_issue
+    gwifi_retry_failure "$SECTION" "$REASON"
+    FINAL_RECORDED=1
+    logger -t gwifi "[$SECTION] All login attempts failed (reason: $REASON)"
+    [ -n "$REASON" ] && [ "$REASON" != "unknown" ] && echo "REASON:$REASON"
+    uci set "gwifi.$SECTION.last_status=offline" 2>/dev/null
+    uci set "gwifi.$SECTION.auth_time=$(date +%Y-%m-%d_%H:%M:%S)"
+    uci set "gwifi.$SECTION.last_error=$REASON"
+    uci commit gwifi
+    exit 1
+fi

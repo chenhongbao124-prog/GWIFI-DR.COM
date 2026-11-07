@@ -1,0 +1,3 @@
+#!/bin/sh
+# The plugin flag controls its own worker; never stop system cron.
+exit 0

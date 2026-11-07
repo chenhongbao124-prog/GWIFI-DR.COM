@@ -1,0 +1,95 @@
+#!/bin/sh
+. /lib/functions.sh
+. /lib/functions/network.sh
+. /usr/lib/gwifi/common.sh
+
+ACTION="$1"
+NAME="$2"
+BASE_DEV="${3:-wan}"
+MODE="${4:-pure}"
+case "$ACTION" in list) ;; create|delete)
+ case "$NAME" in ''|*[!a-zA-Z0-9_]*|wan|lan|loopback) echo '网卡名称无效'; exit 2;; esac
+ [ "${#NAME}" -le 15 ] || exit 2
+ case "$BASE_DEV" in ''|*[!a-zA-Z0-9_.:-]*) exit 2;; esac
+ case "$MODE" in pure|win|ipad|iphone|android) ;; *) exit 2;; esac
+ gwifi_operation_lock || exit 75
+ WAN_ZONE=
+ for zone in $(uci show firewall | sed -n 's/^firewall\.\(.*\)=zone$/\1/p'); do
+  [ "$(uci -q get firewall.$zone.name)" != wan ] || WAN_ZONE="$zone"
+ done
+ [ -n "$WAN_ZONE" ] || { echo '没有找到 WAN 防火墙区域，请先检查网络配置'; exit 1; }
+ ;; *) exit 2;; esac
+
+case "$ACTION" in
+    list)
+        echo -n "["
+        FIRST=1
+        for dev_sec in $(uci show network | grep "=device" | cut -d. -f2 | cut -d= -f1); do
+            if [ "$(uci -q get network.$dev_sec.type)" = "macvlan" ]; then
+                actual_name=$(uci -q get network.$dev_sec.name)
+                parent_dev=$(uci -q get network.$dev_sec.ifname)
+                ip=$(ip -4 addr show dev "$actual_name" 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1)
+                [ -z "$ip" ] && ip="未获取"
+                mac=$(cat /sys/class/net/"$actual_name"/address 2>/dev/null)
+                mode=$(uci -q get network.$actual_name.gwifi_mode || echo "pure")
+                
+                [ "$FIRST" = 1 ] || echo -n ","
+                FIRST=0
+                echo -n "{\"name\":\"$actual_name\",\"base\":\"$parent_dev\",\"ip\":\"$ip\",\"mac\":\"$mac\",\"mode\":\"$mode\"}"
+            fi
+        done
+        echo "]"
+        ;;
+    create)
+        [ -z "$NAME" ] && exit 1
+        
+        # 清理旧配置
+        uci delete network.${NAME}_dev 2>/dev/null
+        uci delete network.$NAME 2>/dev/null
+        uci del_list firewall.$WAN_ZONE.network="$NAME" 2>/dev/null
+
+        uci set network.${NAME}_dev=device
+        uci set network.${NAME}_dev.name="$NAME"
+        uci set network.${NAME}_dev.type="macvlan"
+        uci set network.${NAME}_dev.ifname="$BASE_DEV"
+        uci set network.${NAME}_dev.mode="bridge"
+
+        uci set network.${NAME}=interface
+        uci set network.${NAME}.proto="dhcp"
+        uci set network.${NAME}.device="$NAME"
+        uci set network.${NAME}.metric="100"
+        uci set network.${NAME}.gwifi_mode="$MODE"
+
+        # === 核心伪装逻辑，确保各种设备都有专属特征 ===
+        if [ "$MODE" != "pure" ]; then
+            case "$MODE" in
+                win)     OUIS="94:65:9C AC:1F:6B 3C:7C:3F"; DHCP1="60,MSFT 5.0"; DHCP2="55,1,3,6,15,31,33,43,44,46,47,119,121,249,252" ;;
+                ipad)    OUIS="A4:83:E7 F0:18:98 50:ED:3C"; DHCP1="60,Apple Device"; DHCP2="55,1,3,6,15,119,252" ;;
+                iphone)  OUIS="A4:83:E7 F0:18:98 DC:A9:04"; DHCP1="60,Apple Device"; DHCP2="55,1,3,6,15,119,252" ;;
+                android) OUIS="3C:CD:57 10:7B:44 64:A2:F9"; DHCP1="60,android-dhcp-10"; DHCP2="55,1,3,6,15,26,28,51,58,59,43" ;;
+            esac
+            RAND_OUI=$(echo $OUIS | awk -v r=$RANDOM '{print $((r % NF + 1))}')
+            RAND_MAC=$(printf '%s:%02x:%02x:%02x\n' "$RAND_OUI" $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)))
+            uci set network.${NAME}_dev.macaddr="$RAND_MAC"
+            uci add_list network.${NAME}.dhcp_option="$DHCP1"
+            uci add_list network.${NAME}.dhcp_option="$DHCP2"
+            logger -t gwifi-net "Created $NAME (Mode: $MODE) with MAC $RAND_MAC"
+        else
+            logger -t gwifi-net "Created $NAME (Mode: Pure)"
+        fi
+
+        uci add_list firewall.$WAN_ZONE.network="$NAME" 2>/dev/null
+        uci commit network; uci commit firewall
+        /etc/init.d/network reload
+        ;;
+    delete)
+        [ -z "$NAME" ] && exit 1
+        ifdown "$NAME" 2>/dev/null
+        uci delete network.${NAME}_dev 2>/dev/null
+        uci delete network.$NAME 2>/dev/null
+        uci del_list firewall.$WAN_ZONE.network="$NAME" 2>/dev/null
+        uci commit network; uci commit firewall
+        ip link del "$NAME" 2>/dev/null
+        /etc/init.d/network reload
+        ;;
+esac

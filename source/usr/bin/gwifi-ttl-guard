@@ -1,0 +1,73 @@
+#!/bin/sh
+umask 077
+. /lib/functions.sh
+. /lib/functions/network.sh
+. /usr/lib/gwifi/common.sh
+config_load gwifi
+ACTION="$1"
+[ -n "$ACTION" ] || ACTION=check
+case "$ACTION" in check|repair|status|ack) ;; *) exit 2;; esac
+STATE=/etc/gwifi-events
+mkdir -p "$STATE"
+if [ "$ACTION" = status ]; then
+ . /usr/share/libubox/jshn.sh
+ json_init
+ json_add_string last_check "$(cat /var/run/gwifi-ttl-check 2>/dev/null)"
+ json_add_string warning "$(cat $STATE/ttl-warning 2>/dev/null)"
+ json_add_string history "$(tail -n 40 $STATE/ttl.log 2>/dev/null)"
+ json_dump; exit
+fi
+if [ "$ACTION" = ack ]; then : > "$STATE/ttl-warning"; exit; fi
+config_get_bool ENABLE config ttl_watch 1
+[ "$ENABLE" = 1 ] || [ "$ACTION" = repair ] || exit 0
+exec 8>/var/run/gwifi-ttl.lock; flock -n 8 || exit 0
+TMP=$(mktemp -d /var/run/gwifi-ttl.XXXXXX) || exit 1
+trap 'rm -rf "$TMP"' EXIT
+config_get GLOBAL config default_ttl 0
+BAD=0
+record() {
+ local message="$(date '+%Y-%m-%d %H:%M:%S') $*"
+ printf '%s\n' "$message" >> "$STATE/ttl.log"
+ tail -n 100 "$STATE/ttl.log" > "$TMP/log"; cat "$TMP/log" > "$STATE/ttl.log"
+ printf '%s\n' "$message" > "$STATE/ttl-warning"
+ logger -p daemon.warning -t gwifi-ttl "$*"
+}
+rule() {
+ local section="$1" enabled iface dev spoof ua ttl
+ config_get_bool enabled "$section" enabled 0
+ [ "$enabled" = 1 ] || return
+ config_get iface "$section" iface
+ dev=$(gwifi_device "$iface") || return
+ config_get spoof "$section" spoof_device pc
+ case "$spoof" in pc) ttl=128;; custom) config_get ua "$section" custom_ua; case "$ua" in *Windows*) ttl=128;; *) ttl=64;; esac;; *) ttl=64;; esac
+ case "$GLOBAL" in 64|128) ttl="$GLOBAL";; esac
+ if grep -q "^-A GWF_TTL -o $dev " "$TMP/desired"; then
+  grep -qxF -- "-A GWF_TTL -o $dev -j TTL --ttl-set $ttl" "$TMP/desired" || BAD=1
+  return
+ fi
+ printf '%s\n' "-A GWF_TTL -o $dev -j TTL --ttl-set $ttl" >> "$TMP/desired"
+}
+: > "$TMP/desired"
+config_foreach rule line
+date '+%Y-%m-%d %H:%M:%S' > /var/run/gwifi-ttl-check
+if [ "$BAD" = 1 ]; then record '同一出口配置了不同 TTL，已停止修改，请检查线路设置'; exit 1; fi
+command -v iptables >/dev/null && command -v iptables-restore >/dev/null || { record '缺少 TTL 工具，无法修复'; exit 1; }
+iptables -w 5 -t mangle -S GWF_TTL 2>/dev/null | sed -n '/^-A /p' | sort > "$TMP/actual"
+sort "$TMP/desired" > "$TMP/sorted"
+HOOK=$(iptables -w 5 -t mangle -S POSTROUTING | grep -cxF -- '-A POSTROUTING -j GWF_TTL')
+if cmp -s "$TMP/actual" "$TMP/sorted" && [ "$HOOK" = 1 ]; then exit 0; fi
+{ printf '*mangle
+:GWF_TTL - [0:0]
+-F GWF_TTL
+'; cat "$TMP/desired"; printf 'COMMIT
+'; } > "$TMP/restore"
+if ! iptables-restore -w 5 --noflush < "$TMP/restore"; then record 'TTL 异常，自动修复失败'; exit 1; fi
+while [ "$HOOK" -gt 1 ]; do
+ iptables -w 5 -t mangle -D POSTROUTING -j GWF_TTL || break
+ HOOK=$((HOOK-1))
+done
+iptables -w 5 -t mangle -C POSTROUTING -j GWF_TTL 2>/dev/null || iptables -w 5 -t mangle -A POSTROUTING -j GWF_TTL || { record 'TTL 挂载失败'; exit 1; }
+iptables -w 5 -t mangle -S GWF_TTL | sed -n '/^-A /p' | sort > "$TMP/actual"
+if cmp -s "$TMP/actual" "$TMP/sorted" && iptables -w 5 -t mangle -C POSTROUTING -j GWF_TTL; then
+ record '发现 TTL 规则缺失或与设置不符，已修复并复查通过（规则检查，未抓包验证）'
+else record 'TTL 修复后复查失败'; exit 1; fi

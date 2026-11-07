@@ -1,0 +1,4 @@
+#!/bin/sh
+case "$ACTION" in ifup|ifupdate) ;; *) exit 0;; esac
+[ -n "$INTERFACE" ] || exit 0
+/usr/bin/gwifi-auth-route "$INTERFACE"

@@ -1,0 +1,82 @@
+#!/bin/sh
+. /lib/functions.sh
+. /lib/functions/network.sh
+. /usr/lib/gwifi/common.sh
+ACTION="$1"
+TARGET="$2"
+case "$ACTION" in list) ;; *) gwifi_operation_lock || exit 75;; esac
+
+case "$ACTION" in
+    list)
+        AUTO_METRIC=$(uci -q get gwifi.config.auto_metric || echo "1")
+        echo -n "{\"auto_metric\":$AUTO_METRIC,\"routing\":["
+        FIRST=1
+        for sys_iface in /sys/class/net/wan /sys/class/net/vwan*; do iface=$(basename "$sys_iface");
+            [ -d "/sys/class/net/$iface" ] || continue
+            ip=$(ip -4 addr show dev "$iface" 2>/dev/null | awk '/inet / { split($2,a,"/"); print a[1]; exit }')
+            metric=$(uci -q get network.$iface.metric || echo "0")
+            
+            [ "$FIRST" = 1 ] || echo -n ","
+            FIRST=0
+            echo -n "{\"iface\":\"$iface\",\"ip\":\"${ip:-未获取}\",\"metric\":\"$metric\"}"
+        done
+        echo "]}"
+        ;;
+    set_auto)
+        uci set gwifi.config.auto_metric="$TARGET"
+        uci commit gwifi
+        if [ "$TARGET" = "1" ]; then
+            logger -t gwifi-net "Metric mode switched to 自动"
+            for sys_iface in /sys/class/net/wan /sys/class/net/vwan*; do iface=$(basename "$sys_iface");
+                if [ -d "/sys/class/net/$iface" ]; then
+                    if [ "$iface" = "wan" ]; then uci set network.wan.metric='0'; else uci set network.$iface.metric='100'; fi
+                fi
+            done
+            uci commit network
+            /etc/init.d/network reload
+            logger -t gwifi-net "Auto metric mode: enforced wan=0, vwan*=100"
+        elif [ "$TARGET" = "2" ]; then
+            logger -t gwifi-net "Metric mode switched to 高级 (自定义)"
+        else
+            logger -t gwifi-net "Metric mode switched to 手动"
+        fi
+        echo "Auto metric set to $TARGET."
+        ;;
+    set_primary)
+        AUTO=$(uci -q get gwifi.config.auto_metric || echo "1")
+        if [ "$AUTO" = "1" ]; then
+            logger -t gwifi-net "Blocked manual set_primary because auto mode is enabled."
+            echo "自动模式下禁止手动修改主路由！"
+            exit 1
+        fi
+        for sys_iface in /sys/class/net/wan /sys/class/net/vwan*; do iface=$(basename "$sys_iface");
+            if [ -d "/sys/class/net/$iface" ]; then
+                if [ "$iface" = "$TARGET" ]; then uci set network.$iface.metric='0'; else uci set network.$iface.metric='100'; fi
+            fi
+        done
+        uci commit network
+        /etc/init.d/network reload
+        logger -t gwifi-net "Route switched: primary is $TARGET"
+        echo "Primary interface set to $TARGET."
+        ;;
+    fix_routes)
+        logger -t gwifi-net "Starting policy routing repair via route-ensure.sh..."
+        /usr/bin/gwifi-route-ensure.sh || exit $?
+        logger -t gwifi-net "Policy routing repair completed."
+        echo "Routes fixed."
+        ;;
+    exec_custom)
+        AUTO=$(uci -q get gwifi.config.auto_metric || echo "1")
+        if [ "$AUTO" != "2" ]; then
+            echo "当前非高级模式，禁止执行自定义命令！请先将模式切换为“高级”。"
+            exit 1
+        fi
+        
+        CMD="$TARGET"
+        [ -z "$CMD" ] && { echo "命令不能为空"; exit 1; }
+        logger -t gwifi-net "Executing user-requested custom command (content omitted)"
+        echo "=== 执行结果 ==="
+        eval "$CMD" 2>&1
+        echo -e "\n=== 命令执行完毕 ==="
+        ;;
+esac

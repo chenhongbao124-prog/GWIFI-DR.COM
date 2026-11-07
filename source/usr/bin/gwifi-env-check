@@ -1,0 +1,7 @@
+#!/bin/sh
+for cmd in curl openssl awk sed uci ip flock sha256sum; do
+ command -v "$cmd" >/dev/null 2>&1 || { echo "缺少命令: $cmd"; exit 1; }
+done
+[ -f /usr/lib/gwifi/common.sh ] || exit 1
+# HTTP requests determine reachability; ICMP is not required.
+echo OK

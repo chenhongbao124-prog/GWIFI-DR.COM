@@ -1,0 +1,199 @@
+#!/bin/sh
+umask 077
+. /lib/functions.sh
+. /lib/functions/network.sh
+. /usr/lib/gwifi/common.sh
+. /usr/share/libubox/jshn.sh
+config_load gwifi
+STATE=/etc/gwifi-events
+mkdir -p "$STATE"
+if [ "$1" = status ]; then
+ json_init
+ json_add_string history "$(tail -n 40 $STATE/nas.log 2>/dev/null)"
+ json_add_string warning "$(cat $STATE/nas-warning 2>/dev/null)"
+ json_add_array lines
+ for line in $(uci show gwifi | awk -F= '$2 == "line" {split($1,a,".");print a[2]}'); do
+  json_add_object ""
+  json_add_string section "$line"
+  json_add_string checked "$(cat /var/run/gwifi-nas-time-$line 2>/dev/null)"
+  json_add_string note "$(cat /var/run/gwifi-nas-note-$line 2>/dev/null)"
+  json_add_string detected "$(cat /var/run/gwifi-nas-found-$line 2>/dev/null)"
+  json_close_object
+ done
+ json_close_array
+ json_dump; exit
+fi
+if [ "$1" = ack ]; then : > "$STATE/nas-warning"; exit; fi
+config_get_bool ENABLE config nas_monitor 0
+[ "$ENABLE" = 1 ] || exit 0
+exec 7>/var/run/gwifi-nas.lock; flock -n 7 || exit 0
+exec 9>/var/run/gwifi-check.lock; flock -n 9 || exit 0
+export GWIFI_OP_HELD=1
+config_load gwifi
+TMP=$(mktemp -d /var/run/gwifi-nas.XXXXXX) || exit 1
+trap 'rm -rf "$TMP"' EXIT
+notify() {
+ local text="$(date '+%Y-%m-%d %H:%M:%S') $*"
+ [ "$(cat $STATE/nas-last 2>/dev/null)" != "$*" ] || return
+ printf '%s\n' "$*" > "$STATE/nas-last"
+ printf '%s\n' "$text" >> "$STATE/nas.log"
+ tail -n 100 "$STATE/nas.log" > "$TMP/log"; cat "$TMP/log" > "$STATE/nas.log"
+ printf '%s\n' "$text" > "$STATE/nas-warning"
+ logger -t gwifi-nas "$*"
+}
+probe() {
+ local dev="$1" url loc nas server
+ for url in http://connect.rom.miui.com/generate_204 http://1.1.1.1; do
+  loc=$(curl -4 --noproxy '*' -s --connect-timeout 3 --max-time 6 --interface "$dev" --proto '=http' -D - -o /dev/null "$url" | sed -n 's/^[Ll][Oo][Cc][Aa][Tt][Ii][Oo][Nn]:[[:space:]]*//p' | tr -d '\r' | head -1)
+  case "$loc" in http://*/gportal/*wlanacname=*) ;; *) continue;; esac
+  nas=$(printf '%s' "$loc" | awk -F'wlanacname=' '{split($2,a,"&");print a[1]}')
+  server=$(printf '%s' "$loc" | cut -d/ -f3)
+  case "$nas" in ''|*[!a-zA-Z0-9_.-]*) continue;; esac
+  gwifi_ipv4 "$server" || continue
+  printf '%s %s\n' "$nas" "$server"; return 0
+ done
+ return 1
+}
+find_spare() {
+ local s="$1" allow iface dev parent account pass used active
+ [ -z "$SPARE" ] || return
+ [ "$s" != "$SOURCE" ] || return
+ [ "$(uci -q get gwifi.$s.enabled)" != 1 ] || return
+ [ "$(uci -q get gwifi.$s.manual_hold)" != 1 ] || return
+ gwifi_retry_allowed "$s" >/dev/null 2>&1 || return
+ config_get_bool allow "$s" nas_spare 1
+ [ "$allow" = 1 ] || return
+ config_get iface "$s" iface
+ dev=$(gwifi_device "$iface") || return
+ [ "$dev" != "$SOURCE_DEV" ] || return
+ parent=$(gwifi_parent "$dev")
+ [ "$parent" = "$SOURCE_PARENT" ] || return
+ config_get account "$s" account
+ config_get pass "$s" password
+ [ -n "$account" ] && [ -n "$pass" ] || return
+ used=0
+ for active in $(uci show gwifi | awk -F= '$2 == "line" {split($1,a,".");print a[2]}'); do
+  [ "$(uci -q get gwifi.$active.enabled)" = 1 ] || continue
+  [ "$(uci -q get gwifi.$active.account)" != "$account" ] || used=1
+  active_dev=$(gwifi_device "$(uci -q get gwifi.$active.iface)")
+  [ "$active_dev" != "$dev" ] || used=1
+ done
+ [ "$used" = 0 ] || return
+ gwifi_probe "$dev" "$CHECK_URL" "$CHECK_CODE" && return
+ SPARE="$s"; SPARE_DEV="$dev"
+}
+resume_handover() {
+ local source="$1" spare iface dev rc state
+ spare=$(uci -q get gwifi.$source.pending_spare)
+ case "$spare" in ''|*[!a-zA-Z0-9_]*) return 1;; esac
+ [ "$(uci -q get gwifi.$spare.enabled)" = 1 ] || return 1
+ [ "$(uci -q get gwifi.$spare.manual_hold)" != 1 ] || return 1
+ [ "$(uci -q get gwifi.$spare.auth_nas)" = "$(uci -q get gwifi.$source.pending_nas)" ] || return 1
+ iface=$(uci -q get gwifi.$spare.iface)
+ dev=$(gwifi_device "$iface") || return 1
+ gwifi_probe "$dev" "$CHECK_URL" "$CHECK_CODE" || return 1
+ /usr/bin/gwifi-handover prepare "$source" "$spare"; rc=$?
+ case "$rc" in
+  0) printf '%s\n' "备用线路 $spare 已承接新连接，原连接保留。" > /var/run/gwifi-nas-note-$source; return 0;;
+  3) printf '%s\n' "备用线路 $spare 已验证；本线路不是主出口，未切换流量。" > /var/run/gwifi-nas-note-$source; return 0;;
+  *) state=retry_handover;;
+ esac
+ [ "$(uci -q get gwifi.$source.migration_state)" = "$state" ] || { uci set gwifi.$source.migration_state="$state"; uci commit gwifi; }
+ return 1
+}
+watch_line() {
+ local s="$1" enabled iface dev found newnas newsrv oldnas oldsrv previous
+ config_get_bool enabled "$s" enabled 0
+ [ "$enabled" = 1 ] || return
+ [ "$(uci -q get gwifi.$s.manual_hold)" != 1 ] || return
+ config_get iface "$s" iface
+ dev=$(gwifi_device "$iface") || return
+ gwifi_line_settings "$s"
+ oldnas="$NAS_NAME"; oldsrv="$SRV_IP"
+ if [ -n "$(uci -q get gwifi.$s.pending_spare)" ]; then resume_handover "$s"; fi
+ date '+%Y-%m-%d %H:%M:%S' > /var/run/gwifi-nas-time-$s
+ EVIDENCE=direct
+ found=$(probe "$dev")
+ if [ -z "$found" ]; then
+  SOURCE="$s"; SOURCE_DEV="$dev"; SOURCE_PARENT=$(gwifi_parent "$dev"); SPARE=; SPARE_DEV=
+  config_foreach find_spare line
+  if [ -n "$SPARE_DEV" ]; then found=$(probe "$SPARE_DEV"); EVIDENCE=spare; fi
+ fi
+ if [ -z "$found" ]; then
+  if [ -z "$SPARE_DEV" ]; then
+   printf '%s\n' '当前连接未返回 NAS 名称，同一网口下也没有可用的空闲账号和网卡；继续检查并保留连接。' > /var/run/gwifi-nas-note-$s
+  else
+   printf '%s\n' '当前连接和备用连接均未返回 NAS 名称，暂时无法确认变化；继续检查并保留连接。' > /var/run/gwifi-nas-note-$s
+  fi
+  return
+ fi
+ newnas="${found%% *}"; newsrv="${found#* }"
+ printf '%s\n' "$newnas" > /var/run/gwifi-nas-found-$s
+ printf '%s\n' "$newsrv" > /var/run/gwifi-nas-server-$s
+ printf '%s\n' "检测到 $newnas" > /var/run/gwifi-nas-note-$s
+ if [ "$newnas/$newsrv" = "$oldnas/$oldsrv" ]; then
+  printf '%s\n' "当前 NAS 设置与本次检测一致：$newnas；认证结果请查看线路状态。" > /var/run/gwifi-nas-note-$s
+  : > /var/run/gwifi-nas-$s
+  return
+ fi
+ previous=$(cat /var/run/gwifi-nas-$s 2>/dev/null)
+ printf '%s\n' "$newnas/$newsrv" > /var/run/gwifi-nas-$s
+ [ "$previous" = "$newnas/$newsrv" ] || { notify "[$s] NAS 可能变化：$oldnas → $newnas，等待下次复查"; return; }
+ if [ "$EVIDENCE" = direct ] && ! gwifi_probe "$dev" "$CHECK_URL" "$CHECK_CODE"; then
+  uci set gwifi.$s.nas_name="$newnas"
+  uci set gwifi.$s.srv_ip="$newsrv"
+  uci commit gwifi
+  config_load gwifi
+  if GWIFI_TRIAL=1 /usr/bin/gwifi-login "$s" && gwifi_probe "$dev" "$CHECK_URL" "$CHECK_CODE"; then
+   printf '%s\n' "已更新为本线路确认的 NAS $newnas，认证及联网检查通过。" > /var/run/gwifi-nas-note-$s
+   notify "[$s] 已掉线线路使用新 NAS $newnas 恢复联网"
+  else
+   printf '%s\n' "本线路已确认并更新为 NAS $newnas；认证或联网检查未通过，保留新设置，详情见线路状态。" > /var/run/gwifi-nas-note-$s
+   notify "[$s] NAS 已从 $oldnas 更新为本线路确认的 $newnas；认证或联网检查未通过，保留新设置，其他线路保持不变"
+  fi
+  return
+ fi
+ SOURCE="$s"; SOURCE_DEV="$dev"; SOURCE_PARENT=$(gwifi_parent "$dev"); SPARE=; SPARE_DEV=
+ config_foreach find_spare line
+ if [ "$(uci -q get gwifi.$s.pending_nas)" = "$newnas" ] && [ "$(uci -q get gwifi.$s.pending_srv)" = "$newsrv" ] && [ -n "$(uci -q get gwifi.$s.pending_spare)" ]; then
+  resume_handover "$s" || printf '%s\n' '备用连接或出口接替尚未就绪，将继续检查；当前连接保留。' > /var/run/gwifi-nas-note-$s
+  return
+ fi
+ if [ -z "$SPARE" ]; then notify "[$s] NAS 变为 $newnas，同网口没有可用备用账号，保留旧连接"; return; fi
+ SPARE_FOUND=$(probe "$SPARE_DEV")
+ if [ "$SPARE_FOUND" != "$newnas $newsrv" ]; then
+  notify "[$s] 备用网卡发现的 NAS 与本线路不同，保留各自记录，不交叉替换"
+  return
+ fi
+ NOW=$(cut -d. -f1 /proc/uptime)
+ LAST=$(cat /var/run/gwifi-nas-attempt-$s 2>/dev/null)
+ case "$LAST" in ''|*[!0-9]*) LAST=0;; esac
+ [ "$LAST" = 0 ] || [ "$((NOW-LAST))" -ge 600 ] || return
+ printf '%s\n' "$NOW" > /var/run/gwifi-nas-attempt-$s
+ OLD_SPARE_NAS=$(uci -q get gwifi.$SPARE.nas_name)
+ OLD_SPARE_SRV=$(uci -q get gwifi.$SPARE.srv_ip)
+ uci set gwifi.$SPARE.nas_name="$newnas"
+ uci set gwifi.$SPARE.srv_ip="$newsrv"
+ uci set gwifi.$SPARE.enabled=1
+ uci commit gwifi
+ if GWIFI_TRIAL=1 /usr/bin/gwifi-login "$SPARE" && gwifi_probe "$SPARE_DEV" "$CHECK_URL" "$CHECK_CODE" && gwifi_probe "$SPARE_DEV" "$CHECK_URL" "$CHECK_CODE"; then
+  uci set gwifi.$s.pending_nas="$newnas"
+  uci set gwifi.$s.pending_srv="$newsrv"
+  uci set gwifi.$s.pending_spare="$SPARE"
+  uci set gwifi.$s.migration_state=verified
+  printf '%s\n' "备用线路 $SPARE 已验证新 NAS；当前连接保留，等待本线路确认后迁移" > /var/run/gwifi-nas-note-$s
+  uci commit gwifi
+  /usr/bin/gwifi-ttl-guard repair
+  resume_handover "$s"
+  notify "[$s] $SPARE 已验证新 NAS $newnas；$(cat /var/run/gwifi-nas-note-$s)"
+ else
+  uci set gwifi.$SPARE.enabled=0
+  uci set gwifi.$SPARE.nas_name="$OLD_SPARE_NAS"
+  uci set gwifi.$SPARE.srv_ip="$OLD_SPARE_SRV"
+  uci commit gwifi
+  notify "[$s] 备用账号尝试 $newnas 失败，旧连接保持不变"
+ fi
+}
+config_get CHECK_URL config check_url http://www.baidu.com
+config_get CHECK_CODE config check_code 200
+config_foreach watch_line line

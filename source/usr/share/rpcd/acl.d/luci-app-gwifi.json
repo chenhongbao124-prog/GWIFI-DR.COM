@@ -1,0 +1,81 @@
+{
+  "luci-app-gwifi": {
+    "description": "Grant access to gwifi",
+    "read": {
+      "file": {
+        "/usr/bin/gwifi-status": [
+          "exec"
+        ],
+        "/usr/bin/gwifi-soft-logout": [
+          "exec"
+        ],
+        "/usr/bin/gwifi-reconnect": [
+          "exec"
+        ],
+        "/usr/bin/gwifi-macvlan": [
+          "exec"
+        ],
+        "/usr/bin/gwifi-routing": [
+          "exec"
+        ],
+        "/usr/bin/gwifi-sync-ttl.sh": [
+          "exec"
+        ],
+        "/usr/bin/gwifi-ttl-status.sh": [
+          "exec"
+        ],
+        "/usr/bin/gwifi-dep-check": [
+          "exec"
+        ],
+        "/usr/bin/gwifi-detect": [
+          "exec"
+        ],
+        "/usr/bin/gwifi-get-interfaces": [
+          "exec"
+        ],
+        "/sbin/logread": [
+          "exec"
+        ],
+        "/usr/bin/gwifi-ttl-guard": [
+          "exec"
+        ],
+        "/usr/bin/gwifi-nas-watch": [
+          "exec"
+        ]
+      },
+      "uci": [
+        "gwifi",
+        "network"
+      ]
+    },
+    "write": {
+      "file": {
+        "/usr/bin/gwifi-soft-logout": [
+          "exec"
+        ],
+        "/usr/bin/gwifi-reconnect": [
+          "exec"
+        ],
+        "/usr/bin/gwifi-macvlan": [
+          "exec"
+        ],
+        "/usr/bin/gwifi-routing": [
+          "exec"
+        ],
+        "/usr/bin/gwifi-sync-ttl.sh": [
+          "exec"
+        ],
+        "/usr/bin/gwifi-ttl-guard": [
+          "exec"
+        ],
+        "/usr/bin/gwifi-nas-watch": [
+          "exec"
+        ]
+      },
+      "uci": [
+        "gwifi",
+        "network"
+      ]
+    }
+  }
+}

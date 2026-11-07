@@ -1,0 +1,19 @@
+#!/bin/sh
+set -e
+umask 077
+BACKUP="$1"
+[ -n "$BACKUP" ] || BACKUP=$(cat /etc/gwifi-release-backup 2>/dev/null)
+case "$BACKUP" in /root/gwifi-backups/release-*) ;; *) echo '备份目录无效'; exit 2;; esac
+[ -f "$BACKUP/files.tar.gz" ] && [ -f "$BACKUP/absent" ] || exit 1
+exec 9>/var/run/gwifi-check.lock
+flock -n 9 || { echo '线路正在处理中，请稍后重试恢复'; exit 75; }
+/etc/init.d/gwifi stop
+tar -xzf "$BACKUP/files.tar.gz" -C /
+while IFS= read -r file; do
+ case "$file" in usr/bin/gwifi*|usr/lib/gwifi/*|www/luci-static/resources/view/gwifi/*|etc/hotplug.d/iface/*gwifi*|etc/gwifi-release*|etc/init.d/gwifi|usr/share/rpcd/acl.d/luci-app-gwifi.json|usr/share/luci/menu.d/luci-app-gwifi.json) rm -f "/$file";; *) exit 2;; esac
+done < "$BACKUP/absent"
+flock -u 9
+/etc/init.d/gwifi start
+for cache in /tmp/luci-indexcache.*.json; do [ ! -f "$cache" ] || rm -f "$cache"; done
+/etc/init.d/rpcd reload
+echo '已恢复更新前的程序文件；账号和网络配置保持当前值。'

@@ -1,0 +1,42 @@
+{
+    "admin/services/gwifi": {
+        "title": "Gwifi 校园网工具",
+        "order": 60,
+        "action": { "type": "alias", "path": "admin/services/gwifi/intro" }
+    },
+    "admin/services/gwifi/intro": {
+        "title": "插件介绍",
+        "order": 1,
+        "action": { "type": "view", "path": "gwifi/intro" }
+    },
+    "admin/services/gwifi/main": {
+        "title": "认证设置",
+        "order": 2,
+        "action": { "type": "view", "path": "gwifi/main" }
+    },
+    "admin/services/gwifi/macvlan": {
+        "title": "虚拟网卡(多拨)",
+        "order": 3,
+        "action": { "type": "view", "path": "gwifi/macvlan" }
+    },
+    "admin/services/gwifi/ttl": {
+        "title": "TTL 管理",
+        "order": 4,
+        "action": { "type": "view", "path": "gwifi/ttl" }
+    },
+    "admin/services/gwifi/about": {
+        "title": "Mihomo 参考配置",
+        "order": 5,
+        "action": { "type": "view", "path": "gwifi/about" }
+    },
+    "admin/services/gwifi/env": {
+        "title": "🧩 环境检测",
+        "order": 6,
+        "action": { "type": "view", "path": "gwifi/env" }
+    },
+    "admin/services/gwifi/log": {
+        "title": "运行日志",
+        "order": 7,
+        "action": { "type": "view", "path": "gwifi/log" }
+    }
+}
