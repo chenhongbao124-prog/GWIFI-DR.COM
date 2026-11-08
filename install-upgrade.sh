@@ -25,12 +25,12 @@ rollback_failed_install() {
   tar -xzf "$BACKUP/files.tar.gz" -C /
   while IFS= read -r f; do rm -f "/$f"; done < "$BACKUP/absent"
   flock -u 9
-  /etc/init.d/gwifi start || true
+  if [ -x /etc/init.d/gwifi ]; then /etc/init.d/gwifi start || true; fi
   echo "安装未通过检查，已恢复程序文件。备份：$BACKUP"
  fi
 }
 trap rollback_failed_install EXIT
-/etc/init.d/gwifi stop
+if [ -x /etc/init.d/gwifi ]; then /etc/init.d/gwifi stop; fi
 for f in $FILES; do
  mkdir -p "$(dirname "/$f")"
  cp "$STAGE/$f" "/$f"
