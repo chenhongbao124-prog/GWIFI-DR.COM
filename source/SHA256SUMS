@@ -11,6 +11,7 @@ a94bc84a7e1e25f52725f0b6e1357336cb2c189f046e5075cce09292738cea86  usr/bin/gwifi-
 03d01cee07a3439cef8c8ee617fd84d0183519b0c255a9943bbb314984bfdc48  usr/bin/gwifi-cron.sh
 80270bd16c25c2371225b12cb3d78113f2e52f63e502fb76c3cbfbf79809b45f  usr/bin/gwifi-cron-check
 500b8a589b7f042d9029a47c1805c907dd32dcffcb12dc63b3c1bf62b70708a3  usr/bin/gwifi-background
+bef22b290348e5872449135f3059ff4fdea1f9ce79f82336f48df031e9be9a6a  usr/bin/gwifi-get-interfaces
 5a20bb57e4b1de816635642dd1901f71b8e0cdffc91af27df527d29854abff8c  usr/bin/gwifi-nas-watch
 c9eca0cb191a6b8cd4a4fddc4b103e0f75a1accb97c8d60eacc14596e589827e  usr/bin/gwifi-nas-daemon
 23cf6d5921871b9b601310ded7aa52ea984ff8a1cc24df29ab74d9d975927447  usr/bin/gwifi-handover
@@ -32,3 +33,5 @@ a45ee34f772ff1e230e60de2ed206e1e19e13e6d84ff2f2e7a6b9fd962552ce5  www/luci-stati
 1b9bebaaac266eecfb4f8ec5cf2f706c31290fe7bb90aaf9c0fea85b8a37cc8f  www/luci-static/resources/view/gwifi/about.js
 957bd5256071a9511d4ab702b3ceab49ae0fe950231bd4d1f18f9cc5a3e09dcb  usr/share/luci/menu.d/luci-app-gwifi.json
 c7bae113b8c6748140d4082e5f6790e2c3a3c99eebfb1e20422fec2e1a0c8465  www/luci-static/resources/view/gwifi/intro.js
+36458a128503aba5f492e8b923730e82e471f645ebe73fd435e0df1725af83e9  www/luci-static/resources/view/gwifi/macvlan.js
+7584f265a85116363de4d10afb8ba5735ec5872a05aa64de5acd6c03bc720e9b  www/luci-static/resources/view/gwifi/log.js

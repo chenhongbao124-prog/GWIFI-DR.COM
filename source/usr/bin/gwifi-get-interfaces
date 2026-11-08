@@ -1,0 +1,14 @@
+#!/bin/sh
+IFACES=""
+for i in $(ls /sys/class/net); do
+    # 排除没用的虚拟接口和系统特殊目录
+    case "$i" in
+        lo|docker*|veth*|br-*|bonding_masters|sit*|ip6*|gre*|tun*|wg*|ppp*) continue ;;
+    esac
+    if [ -z "$IFACES" ]; then
+        IFACES="\"$i\""
+    else
+        IFACES="$IFACES,\"$i\""
+    fi
+done
+echo "[$IFACES]"
